@@ -28,6 +28,8 @@ constexpr bool enableValidationLayers = false;
 constexpr bool enableValidationLayers = true;
 #endif
 
+constexpr int MAX_FRAMES_IN_FLIGHT = 2;
+
 static std::vector<const char*> getRequiredExtensions()
 {
     uint32_t glfwExtensionCount = 0;
@@ -91,7 +93,7 @@ private:
         createImageViews();
         createGraphicsPipeline();
         createCommandPool();
-        createCommandBuffer();
+        createCommandBuffers();
         createSyncObjects();
     }
 
@@ -99,7 +101,7 @@ private:
     {
         constexpr vk::ApplicationInfo appInfo { .pApplicationName = "Hello Triangle",
             .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
-            .pEngineName = "No Engine",
+            .pEngineName = "GNC ENGINE",
             .engineVersion = VK_MAKE_VERSION(1, 0, 0),
             .apiVersion = vk::ApiVersion14 };
 
@@ -181,7 +183,7 @@ private:
             .imageMemoryBarrierCount = 1,
             .pImageMemoryBarriers = &barrier
         };
-        commandBuffer.pipelineBarrier2(dependencyInfo);
+        commandBuffers[frameIndex].pipelineBarrier2(dependencyInfo);
     }
 
     void pickPhysicalDevice()
@@ -259,16 +261,23 @@ private:
             .pQueuePriorities = &queuePriority
         };
 
-        // vk::PhysicalDeviceFeatures deviceFeatures;
+        // vk::P
+        // hysicalDeviceFeatures deviceFeatures;
         vk::StructureChain<
             vk::PhysicalDeviceFeatures2,
             vk::PhysicalDeviceVulkan13Features,
             vk::PhysicalDeviceVulkan11Features,
             vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>
             featureChain = {
-                {}, // vk::PhysicalDeviceFeatures2 (empty for now)
-                { .synchronization2 = true, .dynamicRendering = true }, // Enable dynamic rendering from Vulkan 1.3
-                { .shaderDrawParameters = true }, // shader draw parameters
+                {},
+                // vk::PhysicalDeviceFeatures2 (empty for now)
+                {
+                    .synchronization2 = true,
+                    .dynamicRendering = true,
+                }, // Enable dynamic rendering from Vulkan 1.3
+                {
+                    .shaderDrawParameters = true,
+                }, // shader draw parameters
                 { .extendedDynamicState = true }, // Enable extended dynamic state from the extension
             };
 
@@ -441,7 +450,7 @@ private:
             .pColorBlendState = &colorBlending,
             .pDynamicState = &dynamicState,
             .layout = pipelineLayout,
-            .renderPass = nullptr
+            .renderPass = nullptr,
         };
 
         graphicsPipeline = vk::raii::Pipeline(device, nullptr, pipelineInfo);
@@ -456,19 +465,22 @@ private:
         commandPool = vk::raii::CommandPool(device, poolInfo);
     }
 
-    void createCommandBuffer()
+    void createCommandBuffers()
     {
+        commandBuffers.clear();
+
         vk::CommandBufferAllocateInfo allocInfo {
             .commandPool = commandPool,
             .level = vk::CommandBufferLevel::ePrimary,
-            .commandBufferCount = 1
+            .commandBufferCount = MAX_FRAMES_IN_FLIGHT
         };
 
-        commandBuffer = std::move(vk::raii::CommandBuffers(device, allocInfo).front());
+        commandBuffers = vk::raii::CommandBuffers(device, allocInfo);
     }
 
     void recordCommandBuffer(uint32_t imageIndex)
     {
+        auto& commandBuffer = commandBuffers[frameIndex];
         commandBuffer.begin({});
 
         // Before starting rendering, transition the swapchain image to COLOR_ATTACHMENT_OPTIMAL
@@ -524,9 +536,16 @@ private:
 
     void createSyncObjects()
     {
-        presentCompleteSemaphore = vk::raii::Semaphore(device, vk::SemaphoreCreateInfo());
-        renderFinishedSemaphore = vk::raii::Semaphore(device, vk::SemaphoreCreateInfo());
-        drawFence = vk::raii::Fence(device, { .flags = vk::FenceCreateFlagBits::eSignaled });
+        assert(presentCompleteSemaphores.empty() && renderFinishedSemaphores.empty() && inFlightFences.empty());
+
+        for (size_t i = 0; i < swapChainImages.size(); i++) {
+            renderFinishedSemaphores.emplace_back(device, vk::SemaphoreCreateInfo());
+        }
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            presentCompleteSemaphores.emplace_back(device, vk::SemaphoreCreateInfo());
+            inFlightFences.emplace_back(device, vk::FenceCreateInfo { .flags = vk::FenceCreateFlagBits::eSignaled });
+        }
     }
 
     uint32_t findQueueFamilies(vk::raii::PhysicalDevice physicalDevice)
@@ -592,20 +611,37 @@ private:
 
     void drawFrame()
     {
-        graphicsQueue.waitIdle(); // NOTE: for simplicity, wait for the queue to be idle before starting the frame
-                                  // In the next chapter you see how to use multiple frames in flight and fences to sync
+        auto fenceResult = device.waitForFences(*inFlightFences[frameIndex], vk::True, UINT64_MAX);
+        if (fenceResult != vk::Result::eSuccess) {
+            throw std::runtime_error("failed to wait for fence!");
+        }
+        device.resetFences(*inFlightFences[frameIndex]);
 
-        auto [result, imageIndex] = swapChain.acquireNextImage(UINT64_MAX, *presentCompleteSemaphore, nullptr);
+        auto [result, imageIndex] = swapChain.acquireNextImage(UINT64_MAX, *presentCompleteSemaphores[frameIndex], nullptr);
+        commandBuffers[frameIndex].reset();
+
         recordCommandBuffer(imageIndex);
 
-        device.resetFences(*drawFence);
         vk::PipelineStageFlags waitDestinationStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput);
-        const vk::SubmitInfo submitInfo { .waitSemaphoreCount = 1, .pWaitSemaphores = &*presentCompleteSemaphore, .pWaitDstStageMask = &waitDestinationStageMask, .commandBufferCount = 1, .pCommandBuffers = &*commandBuffer, .signalSemaphoreCount = 1, .pSignalSemaphores = &*renderFinishedSemaphore };
-        graphicsQueue.submit(submitInfo, *drawFence);
-        while (vk::Result::eTimeout == device.waitForFences(*drawFence, vk::True, UINT64_MAX))
-            ;
+        const vk::SubmitInfo submitInfo {
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &*presentCompleteSemaphores[frameIndex],
+            .pWaitDstStageMask = &waitDestinationStageMask,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &*commandBuffers[frameIndex],
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &*renderFinishedSemaphores[imageIndex]
+        };
+        graphicsQueue.submit(submitInfo, *inFlightFences[frameIndex]);
 
-        const vk::PresentInfoKHR presentInfoKHR { .waitSemaphoreCount = 1, .pWaitSemaphores = &*renderFinishedSemaphore, .swapchainCount = 1, .pSwapchains = &*swapChain, .pImageIndices = &imageIndex };
+        const vk::PresentInfoKHR presentInfoKHR {
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &*renderFinishedSemaphores[imageIndex],
+            .swapchainCount = 1,
+            .pSwapchains = &*swapChain,
+            .pImageIndices = &imageIndex
+        };
+
         result = graphicsQueue.presentKHR(presentInfoKHR);
         switch (result) {
         case vk::Result::eSuccess:
@@ -616,6 +652,8 @@ private:
         default:
             break; // an unexpected result is returned!
         }
+
+        frameIndex = (frameIndex + 1) % MAX_FRAMES_IN_FLIGHT;
     }
 
     void mainLoop()
@@ -664,6 +702,7 @@ private:
     vk::raii::Queue presentQueue = nullptr;
 
     uint32_t graphicsIndex;
+    uint32_t frameIndex = 0;
 
     vk::SurfaceFormatKHR swapChainSurfaceFormat;
     vk::Extent2D swapChainExtent;
@@ -676,11 +715,11 @@ private:
 
     vk::raii::Pipeline graphicsPipeline = nullptr;
     vk::raii::CommandPool commandPool = nullptr;
-    vk::raii::CommandBuffer commandBuffer = nullptr;
+    std::vector<vk::raii::CommandBuffer> commandBuffers;
 
-    vk::raii::Semaphore presentCompleteSemaphore = nullptr;
-    vk::raii::Semaphore renderFinishedSemaphore = nullptr;
-    vk::raii::Fence drawFence = nullptr;
+    std::vector<vk::raii::Semaphore> presentCompleteSemaphores;
+    std::vector<vk::raii::Semaphore> renderFinishedSemaphores;
+    std::vector<vk::raii::Fence> inFlightFences;
 
     std::vector<const char*>
         deviceExtensions = {
