@@ -15,6 +15,8 @@
 
 #include <cstdlib>
 
+#include <glm/glm.hpp>
+
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
 
@@ -29,6 +31,30 @@ constexpr bool enableValidationLayers = true;
 #endif
 
 constexpr int MAX_FRAMES_IN_FLIGHT = 2;
+
+struct Vertex {
+    glm::vec2 pos;
+    glm::vec3 color;
+
+    static vk::VertexInputBindingDescription getBindingDescription()
+    {
+        return { 0, sizeof(Vertex), vk::VertexInputRate::eVertex };
+    }
+
+    static std::array<vk::VertexInputAttributeDescription, 2> getAttributeDescriptions()
+    {
+        return {
+            vk::VertexInputAttributeDescription(0, 0, vk::Format::eR32G32Sfloat, offsetof(Vertex, pos)),
+            vk::VertexInputAttributeDescription(1, 0, vk::Format::eR32G32B32Sfloat, offsetof(Vertex, color))
+        };
+    }
+};
+
+const std::vector<Vertex> vertices = {
+    { { 0.0f, -0.5f }, { 1.0f, 0.0f, 0.0f } },
+    { { 0.5f, 0.5f }, { 0.0f, 1.0f, 0.0f } },
+    { { -0.5f, 0.5f }, { 0.0f, 0.0f, 1.0f } }
+};
 
 static std::vector<const char*> getRequiredExtensions()
 {
@@ -64,11 +90,11 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL debugCallback(vk::DebugUtilsMessageSever
 
     return vk::False;
 }
-
 class HelloTriangleApplication {
 public:
     void run()
     {
+        initWindow();
         initVulkan();
         mainLoop();
         cleanup();
@@ -77,13 +103,6 @@ public:
 private:
     void initVulkan()
     {
-        glfwInit();
-
-        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-
-        window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
-
         createInstance();
         setupDebugMessenger();
         createSurface();
@@ -93,8 +112,51 @@ private:
         createImageViews();
         createGraphicsPipeline();
         createCommandPool();
+        createVertexBuffer();
         createCommandBuffers();
         createSyncObjects();
+    }
+
+    void initWindow()
+    {
+        glfwInit();
+
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+        glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+
+        window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
+        glfwSetWindowUserPointer(window, this);
+        glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
+    }
+
+    static void framebufferResizeCallback(GLFWwindow* window, int width, int height)
+    {
+        auto app = reinterpret_cast<HelloTriangleApplication*>(glfwGetWindowUserPointer(window));
+        if (app) {
+            app->framebufferResized = true;
+        }
+    }
+
+    void cleanupSwapChain()
+    {
+        swapChainImageViews.clear();
+        swapChain = nullptr;
+    }
+
+    void recreateSwapChain()
+    {
+        int width = 0, height = 0;
+        glfwGetFramebufferSize(window, &width, &height);
+        while (width == 0 || height == 0) {
+            glfwGetFramebufferSize(window, &width, &height);
+            glfwWaitEvents();
+        }
+
+        device.waitIdle();
+
+        cleanupSwapChain();
+        createSwapChain();
+        createImageViews();
     }
 
     void createInstance()
@@ -318,8 +380,7 @@ private:
             .preTransform = surfaceCapabilities.currentTransform,
             .compositeAlpha = vk::CompositeAlphaFlagBitsKHR::eOpaque,
             .presentMode = chooseSwapPresentMode(physicalDevice.getSurfacePresentModesKHR(surface)),
-            .clipped = true,
-            .oldSwapchain = nullptr
+            .clipped = true
         };
 
         swapChain = vk::raii::SwapchainKHR(device, swapChainCreateInfo);
@@ -364,7 +425,15 @@ private:
             fragShaderStageInfo
         };
 
-        vk::PipelineVertexInputStateCreateInfo vertexInputInfo;
+        auto bindingDescription = Vertex::getBindingDescription();
+        auto attributeDescriptions = Vertex::getAttributeDescriptions();
+
+        vk::PipelineVertexInputStateCreateInfo vertexInputInfo {
+            .vertexBindingDescriptionCount = 1,
+            .pVertexBindingDescriptions = &bindingDescription,
+            .vertexAttributeDescriptionCount = attributeDescriptions.size(),
+            .pVertexAttributeDescriptions = attributeDescriptions.data(),
+        };
 
         std::vector dynamicStates = {
             vk::DynamicState::eViewport,
@@ -465,6 +534,44 @@ private:
         commandPool = vk::raii::CommandPool(device, poolInfo);
     }
 
+    uint32_t findMemoryType(uint32_t typeFilter, vk::MemoryPropertyFlags properties)
+    {
+        vk::PhysicalDeviceMemoryProperties memProperties = physicalDevice.getMemoryProperties();
+
+        for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+            if ((typeFilter & (1 << i))
+                && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+                return i;
+            }
+        }
+
+        throw std::runtime_error("failed to find suitable memory type!");
+    }
+
+    void createVertexBuffer()
+    {
+        vk::BufferCreateInfo bufferInfo {
+            .size = sizeof(vertices[0]) * vertices.size(),
+            .usage = vk::BufferUsageFlagBits::eVertexBuffer,
+            .sharingMode = vk::SharingMode::eExclusive
+        };
+
+        vertexBuffer = vk::raii::Buffer(device, bufferInfo);
+
+        vk::MemoryRequirements memRequirements = vertexBuffer.getMemoryRequirements();
+        vk::MemoryAllocateInfo memoryAllocateInfo {
+            .allocationSize = memRequirements.size,
+            .memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)
+        };
+
+        vertexBufferMemory = vk::raii::DeviceMemory(device, memoryAllocateInfo);
+        vertexBuffer.bindMemory(*vertexBufferMemory, 0);
+
+        void* data = vertexBufferMemory.mapMemory(0, bufferInfo.size);
+        memcpy(data, vertices.data(), bufferInfo.size);
+        vertexBufferMemory.unmapMemory();
+    }
+
     void createCommandBuffers()
     {
         commandBuffers.clear();
@@ -513,9 +620,11 @@ private:
         commandBuffer.beginRendering(renderingInfo);
         commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, graphicsPipeline);
 
+        // std::println("{}x{}", swapChainExtent.width, swapChainExtent.height);
         commandBuffer.setViewport(0, vk::Viewport(0.0f, 0.0f, static_cast<float>(swapChainExtent.width), static_cast<float>(swapChainExtent.height), 0.0f, 1.0f));
         commandBuffer.setScissor(0, vk::Rect2D(vk::Offset2D(0, 0), swapChainExtent));
 
+        commandBuffer.bindVertexBuffers(0, *vertexBuffer, { 0 });
         commandBuffer.draw(3, 1, 0, 0);
 
         commandBuffer.endRendering();
@@ -611,15 +720,26 @@ private:
 
     void drawFrame()
     {
+        // Note: inFlightFences, presentCompleteSemaphores, and commandBuffers are indexed by frameIndex,
+        //       while renderFinishedSemaphores is indexed by imageIndex
         auto fenceResult = device.waitForFences(*inFlightFences[frameIndex], vk::True, UINT64_MAX);
         if (fenceResult != vk::Result::eSuccess) {
             throw std::runtime_error("failed to wait for fence!");
         }
-        device.resetFences(*inFlightFences[frameIndex]);
 
         auto [result, imageIndex] = swapChain.acquireNextImage(UINT64_MAX, *presentCompleteSemaphores[frameIndex], nullptr);
-        commandBuffers[frameIndex].reset();
 
+        if (result == vk::Result::eErrorOutOfDateKHR) {
+            recreateSwapChain();
+            return;
+        }
+        if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR) {
+            throw std::runtime_error("failed to acquire swap chain image!");
+        }
+
+        device.resetFences(*inFlightFences[frameIndex]);
+
+        commandBuffers[frameIndex].reset();
         recordCommandBuffer(imageIndex);
 
         vk::PipelineStageFlags waitDestinationStageMask(vk::PipelineStageFlagBits::eColorAttachmentOutput);
@@ -634,25 +754,27 @@ private:
         };
         graphicsQueue.submit(submitInfo, *inFlightFences[frameIndex]);
 
-        const vk::PresentInfoKHR presentInfoKHR {
-            .waitSemaphoreCount = 1,
-            .pWaitSemaphores = &*renderFinishedSemaphores[imageIndex],
-            .swapchainCount = 1,
-            .pSwapchains = &*swapChain,
-            .pImageIndices = &imageIndex
-        };
-
-        result = graphicsQueue.presentKHR(presentInfoKHR);
-        switch (result) {
-        case vk::Result::eSuccess:
-            break;
-        case vk::Result::eSuboptimalKHR:
-            std::cout << "vk::Queue::presentKHR returned vk::Result::eSuboptimalKHR !\n";
-            break;
-        default:
-            break; // an unexpected result is returned!
+        try {
+            const vk::PresentInfoKHR presentInfoKHR { .waitSemaphoreCount = 1,
+                .pWaitSemaphores = &*renderFinishedSemaphores[imageIndex],
+                .swapchainCount = 1,
+                .pSwapchains = &*swapChain,
+                .pImageIndices = &imageIndex };
+            result = graphicsQueue.presentKHR(presentInfoKHR);
+            if (result == vk::Result::eSuboptimalKHR || framebufferResized) {
+                framebufferResized = false;
+                recreateSwapChain();
+            } else if (result != vk::Result::eSuccess) {
+                throw std::runtime_error("failed to present swap chain image!");
+            }
+        } catch (const vk::SystemError& e) {
+            if (e.code().value() == static_cast<int>(vk::Result::eErrorOutOfDateKHR)) {
+                recreateSwapChain();
+                return;
+            } else {
+                throw;
+            }
         }
-
         frameIndex = (frameIndex + 1) % MAX_FRAMES_IN_FLIGHT;
     }
 
@@ -668,6 +790,8 @@ private:
 
     void cleanup()
     {
+        cleanupSwapChain();
+
         glfwDestroyWindow(window);
 
         glfwTerminate();
@@ -715,11 +839,16 @@ private:
 
     vk::raii::Pipeline graphicsPipeline = nullptr;
     vk::raii::CommandPool commandPool = nullptr;
+
+    vk::raii::Buffer vertexBuffer = nullptr;
+    vk::raii::DeviceMemory vertexBufferMemory = nullptr;
+
     std::vector<vk::raii::CommandBuffer> commandBuffers;
 
     std::vector<vk::raii::Semaphore> presentCompleteSemaphores;
     std::vector<vk::raii::Semaphore> renderFinishedSemaphores;
     std::vector<vk::raii::Fence> inFlightFences;
+    bool framebufferResized = false;
 
     std::vector<const char*>
         deviceExtensions = {
