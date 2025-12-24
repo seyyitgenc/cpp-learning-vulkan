@@ -254,11 +254,14 @@ private:
         const auto devIter = std::ranges::find_if(devices,
             [&](const auto& device) {
                 auto queueFamilies = device.getQueueFamilyProperties();
-                bool isSuitable = device.getProperties().apiVersion >= VK_API_VERSION_1_3;
+                auto deviceProperties = device.getProperties();
+
+                bool isSuitable = deviceProperties.apiVersion >= VK_API_VERSION_1_3 && deviceProperties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu;
                 const auto qfpIter = std::ranges::find_if(queueFamilies,
                     [](const vk::QueueFamilyProperties& qfp) {
                         return (qfp.queueFlags & vk::QueueFlagBits::eGraphics) != static_cast<vk::QueueFlags>(0);
                     });
+
                 isSuitable = isSuitable && (qfpIter != queueFamilies.end());
                 auto extensions = device.enumerateDeviceExtensionProperties();
                 bool found = true;
@@ -269,13 +272,15 @@ private:
                 isSuitable = isSuitable && found;
                 if (isSuitable) {
                     physicalDevice = device;
+                    std::println("Selected physical device: {}", std::string(device.getProperties().deviceName));
                 }
                 return isSuitable;
             });
         if (devIter == devices.end()) {
-            throw std::runtime_error("failed to find a suitable GPU!");
+            throw std::runtime_error("Failed to find a suitable GPU!");
         }
     }
+
     void createLogicalDevice()
     {
         std::vector<vk::QueueFamilyProperties> queueFamilyProperties = physicalDevice.getQueueFamilyProperties();
@@ -323,8 +328,6 @@ private:
             .pQueuePriorities = &queuePriority
         };
 
-        // vk::P
-        // hysicalDeviceFeatures deviceFeatures;
         vk::StructureChain<
             vk::PhysicalDeviceFeatures2,
             vk::PhysicalDeviceVulkan13Features,
@@ -548,28 +551,77 @@ private:
         throw std::runtime_error("failed to find suitable memory type!");
     }
 
-    void createVertexBuffer()
+    void createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage, vk::MemoryPropertyFlags properties, vk::raii::Buffer& buffer, vk::raii::DeviceMemory& bufferMemory)
     {
         vk::BufferCreateInfo bufferInfo {
-            .size = sizeof(vertices[0]) * vertices.size(),
-            .usage = vk::BufferUsageFlagBits::eVertexBuffer,
+            .size = size,
+            .usage = usage,
             .sharingMode = vk::SharingMode::eExclusive
         };
+        buffer = vk::raii::Buffer(device, bufferInfo);
+        vk::MemoryRequirements memRequirements = buffer.getMemoryRequirements();
+        vk::MemoryAllocateInfo allocInfo {
+            .allocationSize = memRequirements.size,
+            .memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties)
+        };
+        bufferMemory = vk::raii::DeviceMemory(device, allocInfo);
+        buffer.bindMemory(*bufferMemory, 0);
+    }
 
+    void createVertexBuffer()
+    {
+        vk::DeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
+
+        vk::BufferCreateInfo stagingInfo {
+            .size = bufferSize,
+            .usage = vk::BufferUsageFlagBits::eTransferSrc,
+            .sharingMode = vk::SharingMode::eExclusive
+        };
+        vk::raii::Buffer stagingBuffer(device, stagingInfo);
+        vk::MemoryRequirements memRequirementsStaging = stagingBuffer.getMemoryRequirements();
+        vk::MemoryAllocateInfo memoryAllocateInfoStaging {
+            .allocationSize = memRequirementsStaging.size,
+            .memoryTypeIndex = findMemoryType(memRequirementsStaging.memoryTypeBits, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)
+        };
+        vk::raii::DeviceMemory stagingBufferMemory(device, memoryAllocateInfoStaging);
+
+        stagingBuffer.bindMemory(stagingBufferMemory, 0);
+        void* dataStaging = stagingBufferMemory.mapMemory(0, stagingInfo.size);
+        memcpy(dataStaging, vertices.data(), stagingInfo.size);
+        stagingBufferMemory.unmapMemory();
+
+        vk::BufferCreateInfo bufferInfo {
+            .size = bufferSize,
+            .usage = vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst,
+            .sharingMode = vk::SharingMode::eExclusive
+        };
         vertexBuffer = vk::raii::Buffer(device, bufferInfo);
 
         vk::MemoryRequirements memRequirements = vertexBuffer.getMemoryRequirements();
         vk::MemoryAllocateInfo memoryAllocateInfo {
             .allocationSize = memRequirements.size,
-            .memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)
+            .memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal)
         };
-
         vertexBufferMemory = vk::raii::DeviceMemory(device, memoryAllocateInfo);
+
         vertexBuffer.bindMemory(*vertexBufferMemory, 0);
 
-        void* data = vertexBufferMemory.mapMemory(0, bufferInfo.size);
-        memcpy(data, vertices.data(), bufferInfo.size);
-        vertexBufferMemory.unmapMemory();
+        copyBuffer(stagingBuffer, vertexBuffer, stagingInfo.size);
+    }
+
+    void copyBuffer(vk::raii::Buffer& srcBuffer, vk::raii::Buffer& dstBuffer, vk::DeviceSize size)
+    {
+        vk::CommandBufferAllocateInfo allocInfo {
+            .commandPool = commandPool,
+            .level = vk::CommandBufferLevel::ePrimary,
+            .commandBufferCount = 1
+        };
+        vk::raii::CommandBuffer commandCopyBuffer = std::move(device.allocateCommandBuffers(allocInfo).front());
+        commandCopyBuffer.begin(vk::CommandBufferBeginInfo { .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+        commandCopyBuffer.copyBuffer(srcBuffer, dstBuffer, vk::BufferCopy(0, 0, size));
+        commandCopyBuffer.end();
+        graphicsQueue.submit(vk::SubmitInfo { .commandBufferCount = 1, .pCommandBuffers = &*commandCopyBuffer }, nullptr);
+        graphicsQueue.waitIdle();
     }
 
     void createCommandBuffers()
@@ -618,6 +670,7 @@ private:
         };
 
         commandBuffer.beginRendering(renderingInfo);
+
         commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, graphicsPipeline);
 
         // std::println("{}x{}", swapChainExtent.width, swapChainExtent.height);
@@ -659,13 +712,12 @@ private:
 
     uint32_t findQueueFamilies(vk::raii::PhysicalDevice physicalDevice)
     {
-        // find the index of the first queue family that supports graphics
         std::vector<vk::QueueFamilyProperties> queueFamilyProperties = physicalDevice.getQueueFamilyProperties();
 
         // get the first index into queueFamilyProperties which supports graphics
         auto graphicsQueueFamilyProperty = std::find_if(queueFamilyProperties.begin(),
             queueFamilyProperties.end(),
-            [](vk::QueueFamilyProperties const& qfp) { return qfp.queueFlags & vk::QueueFlagBits::eGraphics; });
+            [](const vk::QueueFamilyProperties& qfp) { return qfp.queueFlags & vk::QueueFlagBits::eGraphics; });
 
         return static_cast<uint32_t>(std::distance(queueFamilyProperties.begin(), graphicsQueueFamilyProperty));
     }
